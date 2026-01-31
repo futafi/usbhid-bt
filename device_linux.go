@@ -124,74 +124,62 @@ func sysfsReadAsHexUint16(dir string, entry string) (uint16, error) {
 func enumerate() ([]*Device, error) {
 	rv := []*Device{}
 
-	if err := filepath.Walk("/sys/bus/usb/devices", func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.Mode()&os.ModeSymlink == 0 || strings.Contains(info.Name(), ":") {
-			return nil
-		}
-
-		vendorId, err := sysfsReadAsHexUint16(path, "idVendor")
-		if err != nil {
-			return nil
-		}
-
-		productId, err := sysfsReadAsHexUint16(path, "idProduct")
-		if err != nil {
-			return nil
-		}
-
-		version, err := sysfsReadAsHexUint16(path, "bcdDevice")
-		if err != nil {
-			return nil
-		}
-
-		var manufacturer string
-		if m, err := sysfsReadAsString(path, "manufacturer"); err == nil {
-			manufacturer = m
-		}
-
-		var product string
-		if p, err := sysfsReadAsString(path, "product"); err == nil {
-			product = p
-		}
-
-		var serialNumber string
-		if s, err := sysfsReadAsString(path, "serial"); err == nil {
-			serialNumber = s
-		}
-
-		files, err := filepath.Glob(filepath.Join(path, "[0-9]*", "[0-9]*", "hidraw", "hidraw[0-9]*"))
-		if err != nil {
-			return nil
-		}
-
-		for _, f := range files {
-			hidpath := filepath.Dir(filepath.Dir(f))
-			descriptor, err := sysfsReadAsBytes(hidpath, "report_descriptor")
-			if err != nil {
-				continue
-			}
-
-			d := &Device{
-				path:         filepath.Join("/dev", filepath.Base(f)),
-				vendorId:     vendorId,
-				productId:    productId,
-				version:      version,
-				manufacturer: manufacturer,
-				product:      product,
-				serialNumber: serialNumber,
-			}
-			d.usagePage, d.usage, d.reportInputLength, d.reportOutputLength, d.reportFeatureLength, d.reportWithId = hidParseReportDescriptor(descriptor)
-
-			rv = append(rv, d)
-		}
-
-		return nil
-	}); err != nil {
+	// Scan /sys/class/hidraw/ for all HID devices (USB + Bluetooth)
+	hidrawDirs, err := filepath.Glob("/sys/class/hidraw/hidraw*")
+	if err != nil {
 		return nil, err
+	}
+
+	for _, hidrawDir := range hidrawDirs {
+		deviceDir := filepath.Join(hidrawDir, "device")
+
+		// Read uevent file to get HID_ID and HID_NAME
+		uevent, err := sysfsReadAsString(deviceDir, "uevent")
+		if err != nil {
+			continue
+		}
+
+		var vendorId, productId, version uint16
+		var hidName string
+
+		// Parse uevent file
+		// HID_ID format: BUS:VENDOR:PRODUCT (e.g., 0005:0000057E:00002006)
+		for _, line := range strings.Split(uevent, "\n") {
+			if strings.HasPrefix(line, "HID_ID=") {
+				parts := strings.Split(strings.TrimPrefix(line, "HID_ID="), ":")
+				if len(parts) == 3 {
+					if v, err := strconv.ParseUint(parts[1], 16, 16); err == nil {
+						vendorId = uint16(v)
+					}
+					if p, err := strconv.ParseUint(parts[2], 16, 16); err == nil {
+						productId = uint16(p)
+					}
+				}
+			} else if strings.HasPrefix(line, "HID_NAME=") {
+				hidName = strings.TrimPrefix(line, "HID_NAME=")
+			}
+		}
+
+		if vendorId == 0 || productId == 0 {
+			continue
+		}
+
+		// Read report descriptor
+		descriptor, err := sysfsReadAsBytes(deviceDir, "report_descriptor")
+		if err != nil {
+			continue
+		}
+
+		d := &Device{
+			path:      filepath.Join("/dev", filepath.Base(hidrawDir)),
+			vendorId:  vendorId,
+			productId: productId,
+			version:   version,
+			product:   hidName,
+		}
+		d.usagePage, d.usage, d.reportInputLength, d.reportOutputLength, d.reportFeatureLength, d.reportWithId = hidParseReportDescriptor(descriptor)
+
+		rv = append(rv, d)
 	}
 
 	return rv, nil
